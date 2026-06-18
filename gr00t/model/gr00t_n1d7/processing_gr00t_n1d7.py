@@ -78,13 +78,32 @@ EMBODIMENT_TAG_TO_PROJECTOR_INDEX = {
 }
 
 
+def _resolve_hf_local(model_name: str) -> str:
+    """Resolve a HF hub model ID to its local cache snapshot path.
+
+    Falls back to the original model_name if no local cache is found,
+    letting from_pretrained handle the error.
+    """
+    import os
+    from pathlib import Path
+
+    cache_dir = os.environ.get("HF_HOME", os.path.join(os.path.expanduser("~"), ".cache", "huggingface"))
+    refs = Path(cache_dir) / "hub" / f"models--{model_name.replace('/', '--')}" / "refs" / "main"
+    if refs.exists():
+        snapshot = refs.parent.parent / "snapshots" / refs.read_text().strip()
+        if snapshot.is_dir():
+            return str(snapshot)
+    return model_name
+
+
 def build_processor(model_name: str, transformers_loading_kwargs: dict) -> Qwen3VLProcessor:
     if Qwen3VLProcessor is None:
         raise ImportError(
             "Qwen3VLProcessor is not available. "
             "Please upgrade transformers: pip install transformers>=4.52.0"
         )
-    return Qwen3VLProcessor.from_pretrained(model_name, **transformers_loading_kwargs)
+    local_path = _resolve_hf_local(model_name)
+    return Qwen3VLProcessor.from_pretrained(local_path, **transformers_loading_kwargs)
 
 
 class Gr00tN1d7DataCollator:
@@ -259,6 +278,30 @@ class Gr00tN1d7Processor(BaseProcessor):
         )
         self.train()
 
+    def _get_state_split_keys(
+        self, modality_config: dict[str, ModalityConfig]
+    ) -> tuple[list[str], list[str]]:
+        state_config = modality_config["state"]
+        state_keys = list(state_config.modality_keys)
+        metadata = getattr(state_config, "metadata", {}) or {}
+        tactile_keys = list(metadata.get("tactile_keys", []))
+        if not tactile_keys:
+            return state_keys, []
+
+        missing = [key for key in tactile_keys if key not in state_keys]
+        if missing:
+            raise ValueError(f"tactile_keys not present in state.modality_keys: {missing}")
+        tactile_key_set = set(tactile_keys)
+        motor_keys = [key for key in state_keys if key not in tactile_key_set]
+        return motor_keys, tactile_keys
+
+    def _pad_last_dim(self, tensor: torch.Tensor, target_dim: int, label: str) -> torch.Tensor:
+        assert tensor.shape[-1] <= target_dim, (
+            f"{label} dimension {tensor.shape[-1]} exceeds configured maximum {target_dim}"
+        )
+        padding_shape = (*tensor.shape[:-1], target_dim - tensor.shape[-1])
+        return torch.cat([tensor, torch.zeros(padding_shape, dtype=tensor.dtype)], dim=-1)
+
     @property
     def collator(self):
         return self._collator
@@ -385,33 +428,38 @@ class Gr00tN1d7Processor(BaseProcessor):
         modality_config = self.modality_configs[embodiment_tag.value]
         transformed_observation = {}
 
-        # Normalize states
+        # Normalize states. A2 tactile-token configs keep tactile keys under the
+        # state modality for loader compatibility, then split them here.
         state_keys = modality_config["state"].modality_keys
+        motor_state_keys, tactile_state_keys = self._get_state_split_keys(modality_config)
         state_data = {key: observation[f"state.{key}"] for key in state_keys}
         exclude_state = self.exclude_state or getattr(
             modality_config["state"], "exclude_state", False
         )
-        if exclude_state:
-            normalized_states = torch.cat(
-                [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
-            )
-        else:
+        norm_state_dict = None
+        if not exclude_state or tactile_state_keys:
             norm_state_dict = self.state_action_processor.apply_state(
                 state=state_data, embodiment_tag=embodiment_tag.value
             )
-            normalized_states = torch.cat(
-                [torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1
-            )
 
-        assert normalized_states.shape[1] <= self.max_state_dim, (
-            f"State dimension {normalized_states.shape[1]} exceeds max_state_dim {self.max_state_dim}"
+        if exclude_state:
+            normalized_states = torch.cat(
+                [torch.from_numpy(np.zeros_like(state_data[key])) for key in motor_state_keys],
+                dim=-1,
+            )
+        else:
+            normalized_states = torch.cat(
+                [torch.from_numpy(norm_state_dict[key]) for key in motor_state_keys], dim=-1
+            )
+        transformed_observation["state"] = self._pad_last_dim(
+            normalized_states, self.max_state_dim, "State"
         )
-        padding_shape = (
-            *normalized_states.shape[:-1],
-            self.max_state_dim - normalized_states.shape[-1],
-        )
-        normalized_states = torch.cat([normalized_states, torch.zeros(padding_shape)], dim=-1)
-        transformed_observation["state"] = normalized_states
+
+        if tactile_state_keys:
+            tactile_states = torch.cat(
+                [torch.from_numpy(norm_state_dict[key]) for key in tactile_state_keys], dim=-1
+            )
+            transformed_observation["tactile"] = tactile_states
 
         # Process images: observation values are (B, T, H, W, C) numpy arrays
         image_keys = modality_config["video"].modality_keys
@@ -569,33 +617,52 @@ class Gr00tN1d7Processor(BaseProcessor):
             normalized_actions = None
             action_mask = None
 
-        # Concatenate states with optional dropout/noise augmentation
-        state_keys = self.modality_configs[embodiment_tag.value]["state"].modality_keys
+        # Concatenate states with optional dropout/noise augmentation. A2 configs
+        # split tactile latents out before motor-state padding.
+        modality_config = self.modality_configs[embodiment_tag.value]
+        motor_state_keys, tactile_state_keys = self._get_state_split_keys(modality_config)
         exclude_state = self.exclude_state or getattr(
-            self.modality_configs[embodiment_tag.value]["state"], "exclude_state", False
+            modality_config["state"], "exclude_state", False
         )
-        if exclude_state or (
+        drop_state = (
             self.state_dropout_prob > 0
             and random.random() < self.state_dropout_prob
             and self.training
-        ):
+        )
+        if exclude_state or drop_state:
             normalized_states = torch.cat(
-                [torch.from_numpy(np.zeros_like(state_data[key])) for key in state_keys], dim=-1
+                [torch.from_numpy(np.zeros_like(state_data[key])) for key in motor_state_keys],
+                dim=-1,
             )
         else:
             normalized_states = torch.cat(
-                [torch.from_numpy(norm_state_dict[key]) for key in state_keys], dim=-1
+                [torch.from_numpy(norm_state_dict[key]) for key in motor_state_keys], dim=-1
             )
-        normalized_states = torch.cat(
-            [
-                normalized_states,
-                torch.zeros(
-                    normalized_states.shape[0],
-                    self.max_state_dim - normalized_states.shape[1],
-                ),
-            ],
-            dim=-1,
-        )
+        metadata = getattr(modality_config["state"], "metadata", {}) or {}
+        future_tactile_keys = list(metadata.get("future_tactile_keys", []))
+        future_tactile_horizon = int(metadata.get("future_tactile_horizon", 0) or 0)
+        future_tactile = None
+        if future_tactile_keys:
+            missing = [key for key in future_tactile_keys if key not in norm_state_dict]
+            if missing:
+                raise ValueError(f"future_tactile_keys not present in normalized state: {missing}")
+            if future_tactile_horizon <= 0:
+                raise ValueError(
+                    "future_tactile_horizon must be positive when future_tactile_keys are set"
+                )
+            future_tactile = torch.cat(
+                [torch.from_numpy(norm_state_dict[key]) for key in future_tactile_keys], dim=-1
+            )[:future_tactile_horizon]
+
+        # The loader may fetch a state horizon for future tactile targets, but
+        # the action head still consumes only the current state timestep.
+        normalized_states = normalized_states[:1]
+        normalized_states = self._pad_last_dim(normalized_states, self.max_state_dim, "State")
+        tactile_states = None
+        if tactile_state_keys:
+            tactile_states = torch.cat(
+                [torch.from_numpy(norm_state_dict[key]) for key in tactile_state_keys], dim=-1
+            )[:1]
 
         # Crop and resize images.
         if self.training:
@@ -621,6 +688,10 @@ class Gr00tN1d7Processor(BaseProcessor):
         transformed_inputs = {
             "state": normalized_states.to(torch.get_default_dtype()),
         }
+        if tactile_states is not None:
+            transformed_inputs["tactile"] = tactile_states.to(torch.get_default_dtype())
+        if future_tactile is not None:
+            transformed_inputs["future_tactile"] = future_tactile.to(torch.get_default_dtype())
         if normalized_actions is not None:
             transformed_inputs["action"] = normalized_actions.to(torch.get_default_dtype())
         # Add VLM inputs

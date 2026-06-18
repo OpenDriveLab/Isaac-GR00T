@@ -293,7 +293,11 @@ class ShardedSingleStepDataset(ShardedDataset):
         for ep_idx, step_indices in episodes:
             # Load episode data once per episode in shard
             episode_data = self.episode_loader[ep_idx]
+            ep_len = len(episode_data)
+            usable_len = max(0, ep_len - self.action_horizon + 1)
             for step_index in step_indices:
+                if step_index >= usable_len:
+                    continue
                 datapoints.append(self.get_datapoint(episode_data, step_index))
         return datapoints
 

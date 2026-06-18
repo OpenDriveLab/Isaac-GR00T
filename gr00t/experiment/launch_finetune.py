@@ -80,6 +80,17 @@ if __name__ == "__main__":
     config.model.tune_projector = ft_config.tune_projector
     config.model.tune_diffusion_model = ft_config.tune_diffusion_model
     config.model.state_dropout_prob = ft_config.state_dropout_prob
+    config.model.use_tactile_token = ft_config.use_tactile_token
+    config.model.tactile_latent_dim = ft_config.tactile_latent_dim
+    config.model.tactile_dropout_prob = ft_config.tactile_dropout_prob
+    config.model.use_future_tactile_aux = ft_config.use_future_tactile_aux
+    config.model.future_tactile_loss_weight = ft_config.future_tactile_loss_weight
+    config.model.future_tactile_dim = ft_config.future_tactile_dim
+    config.model.future_tactile_horizon = ft_config.future_tactile_horizon
+    config.model.use_joint_tactile_denoising = ft_config.use_joint_tactile_denoising
+    config.model.joint_tactile_loss_weight = ft_config.joint_tactile_loss_weight
+    config.model.joint_tactile_dim = ft_config.joint_tactile_dim
+    config.model.joint_tactile_horizon = ft_config.joint_tactile_horizon
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     if ft_config.extra_augmentation_config:
@@ -100,6 +111,8 @@ if __name__ == "__main__":
     config.training.dataloader_num_workers = ft_config.dataloader_num_workers
     config.training.learning_rate = ft_config.learning_rate
     config.training.gradient_accumulation_steps = ft_config.gradient_accumulation_steps
+    config.training.deepspeed_stage = ft_config.deepspeed_stage
+    config.training.gradient_checkpointing = ft_config.gradient_checkpointing
     config.training.output_dir = ft_config.output_dir
     config.training.save_steps = ft_config.save_steps
     config.training.save_total_limit = ft_config.save_total_limit
@@ -113,6 +126,7 @@ if __name__ == "__main__":
     config.data.shard_size = ft_config.shard_size
     config.data.episode_sampling_rate = ft_config.episode_sampling_rate
     config.data.num_shards_per_epoch = ft_config.num_shards_per_epoch
+    config.data.video_backend = ft_config.video_backend
 
     config.training.save_only_model = ft_config.save_only_model
     config.training.skip_weight_loading = ft_config.skip_weight_loading

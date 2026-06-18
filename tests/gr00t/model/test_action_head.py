@@ -121,6 +121,75 @@ class TestActionHeadForward:
         out = head.forward(_make_backbone_output(config), _make_action_input(config))
         assert torch.isfinite(out["loss"])
 
+    def test_future_tactile_aux_requires_target(self):
+        config = _small_config(
+            use_future_tactile_aux=True,
+            future_tactile_dim=5,
+            future_tactile_horizon=3,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        action_input = _make_action_input(config)
+        with pytest.raises(RuntimeError, match="use_future_tactile_aux=True"):
+            head.forward(_make_backbone_output(config), action_input)
+
+    def test_future_tactile_aux_outputs_loss_and_prediction(self):
+        config = _small_config(
+            use_future_tactile_aux=True,
+            future_tactile_dim=5,
+            future_tactile_horizon=3,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        action_input = _make_action_input(config)
+        action_input["future_tactile"] = torch.randn(2, config.future_tactile_horizon, 5)
+        out = head.forward(_make_backbone_output(config), action_input)
+        assert "future_tactile_loss" in out
+        assert "future_tactile_pred" in out
+        assert out["future_tactile_pred"].shape == (2, config.future_tactile_horizon, 5)
+        assert torch.isfinite(out["future_tactile_loss"])
+        assert torch.isfinite(out["future_tactile_pred"]).all()
+
+    def test_joint_tactile_denoising_requires_target(self):
+        config = _small_config(
+            use_tactile_token=True,
+            tactile_latent_dim=5,
+            use_joint_tactile_denoising=True,
+            joint_tactile_dim=5,
+            joint_tactile_horizon=3,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        action_input = _make_action_input(config)
+        with pytest.raises(RuntimeError, match="use_joint_tactile_denoising=True"):
+            head.forward(_make_backbone_output(config), action_input)
+
+    def test_joint_tactile_denoising_outputs_loss_and_velocity(self):
+        config = _small_config(
+            use_tactile_token=True,
+            tactile_latent_dim=5,
+            use_joint_tactile_denoising=True,
+            joint_tactile_dim=5,
+            joint_tactile_horizon=3,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        action_input = _make_action_input(config)
+        action_input["tactile"] = torch.randn(2, 1, 5)
+        action_input["future_tactile"] = torch.randn(2, config.joint_tactile_horizon, 5)
+        out = head.forward(_make_backbone_output(config), action_input)
+        assert "joint_tactile_loss" in out
+        assert "pred_future_tactile_velocity" in out
+        assert out["pred_future_tactile_velocity"].shape == (2, config.joint_tactile_horizon, 5)
+        assert torch.isfinite(out["loss"])
+        assert torch.isfinite(out["joint_tactile_loss"])
+        assert torch.isfinite(out["pred_future_tactile_velocity"]).all()
+
+    def test_future_aux_and_joint_denoising_are_mutually_exclusive(self):
+        config = _small_config(
+            use_tactile_token=True,
+            use_future_tactile_aux=True,
+            use_joint_tactile_denoising=True,
+        )
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            Gr00tN1d7ActionHead(config)
+
 
 class TestActionHeadGetAction:
     """Test inference (denoising loop)."""
@@ -149,6 +218,24 @@ class TestActionHeadGetAction:
             action_input,
         )
         assert out["action_pred"].shape[0] == 1
+
+    def test_get_action_joint_tactile_denoising_keeps_action_shape(self):
+        config = _small_config(
+            use_tactile_token=True,
+            tactile_latent_dim=5,
+            use_joint_tactile_denoising=True,
+            joint_tactile_dim=5,
+            joint_tactile_horizon=3,
+        )
+        head = Gr00tN1d7ActionHead(config)
+        action_input = _make_action_input(config)
+        action_input["tactile"] = torch.randn(2, 1, 5)
+        del action_input["action"]
+        out = head.get_action(_make_backbone_output(config), action_input)
+        assert out["action_pred"].shape == (2, config.action_horizon, config.max_action_dim)
+        assert out["future_tactile_pred"].shape == (2, config.joint_tactile_horizon, 5)
+        assert torch.isfinite(out["action_pred"]).all()
+        assert torch.isfinite(out["future_tactile_pred"]).all()
 
 
 class TestActionHeadEncodeFeatures:

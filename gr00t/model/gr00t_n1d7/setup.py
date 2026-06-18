@@ -44,6 +44,57 @@ def convert_tensors_to_lists(obj):
         return obj
 
 
+def _reinit_missing_action_head_params(
+    model, missing_keys: list[str], model_config
+) -> tuple[list[str], list[str], list[str]]:
+    """Re-initialize action_head parameters that are absent from the checkpoint.
+
+    Returns key lists so callers can classify them as allowed missing keys.
+    """
+    tactile_missing = [
+        k for k in missing_keys
+        if model_config.use_tactile_token
+        and ("action_head.tactile_" in k or k == "action_head.null_tactile_token")
+    ]
+    if tactile_missing:
+        model.action_head.reset_tactile_token_parameters()
+        logging.info(
+            "Tactile token params not in checkpoint — re-initialized: %s",
+            tactile_missing,
+        )
+
+    future_tactile_missing = [
+        k for k in missing_keys
+        if model_config.use_future_tactile_aux
+        and "action_head.future_tactile_decoder" in k
+    ]
+    if future_tactile_missing:
+        model.action_head.reset_future_tactile_parameters()
+        logging.info(
+            "Future tactile decoder params not in checkpoint — re-initialized: %s",
+            future_tactile_missing,
+        )
+
+    joint_tactile_missing = [
+        k for k in missing_keys
+        if model_config.use_joint_tactile_denoising
+        and (
+            "action_head.future_tactile_encoder" in k
+            or "action_head.joint_tactile_velocity_decoder" in k
+            or k == "action_head.action_type_embedding"
+            or k == "action_head.joint_future_tactile_type_embedding"
+        )
+    ]
+    if joint_tactile_missing:
+        model.action_head.reset_joint_tactile_denoising_parameters()
+        logging.info(
+            "Joint tactile denoising params not in checkpoint — re-initialized: %s",
+            joint_tactile_missing,
+        )
+
+    return tactile_missing, future_tactile_missing, joint_tactile_missing
+
+
 class Gr00tN1d7Pipeline(ModelPipeline):
     model_class = Gr00tN1d7
     processor_class = Gr00tN1d7Processor
@@ -87,6 +138,17 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                 tune_diffusion_model=self.config.model.tune_diffusion_model,
                 tune_vlln=self.config.model.tune_vlln,
                 state_dropout_prob=self.config.model.state_dropout_prob,
+                use_tactile_token=self.config.model.use_tactile_token,
+                tactile_latent_dim=self.config.model.tactile_latent_dim,
+                tactile_dropout_prob=self.config.model.tactile_dropout_prob,
+                use_future_tactile_aux=self.config.model.use_future_tactile_aux,
+                future_tactile_loss_weight=self.config.model.future_tactile_loss_weight,
+                future_tactile_dim=self.config.model.future_tactile_dim,
+                future_tactile_horizon=self.config.model.future_tactile_horizon,
+                use_joint_tactile_denoising=self.config.model.use_joint_tactile_denoising,
+                joint_tactile_loss_weight=self.config.model.joint_tactile_loss_weight,
+                joint_tactile_dim=self.config.model.joint_tactile_dim,
+                joint_tactile_horizon=self.config.model.joint_tactile_horizon,
                 backbone_trainable_params_fp32=self.config.model.backbone_trainable_params_fp32,
                 load_bf16=self.config.model.load_bf16,
                 transformers_loading_kwargs=self.transformers_loading_kwargs,
@@ -105,7 +167,21 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
             unexpected_keys = loading_info.get("unexpected_keys", [])
             mismatched_keys = loading_info.get("mismatched_keys", [])
-            other_missing = [k for k in missing_keys if "mask_token" not in k]
+
+            (
+                tactile_missing,
+                future_tactile_missing,
+                joint_tactile_missing,
+            ) = _reinit_missing_action_head_params(
+                model, missing_keys, self.config.model
+            )
+
+            allowed_missing = {k for k in missing_keys if "mask_token" in k}
+            allowed_missing.update(tactile_missing)
+            allowed_missing.update(future_tactile_missing)
+            allowed_missing.update(joint_tactile_missing)
+            other_missing = [k for k in missing_keys if k not in allowed_missing]
+
             errors = []
             if other_missing:
                 errors.append(f"Missing keys ({len(other_missing)}): {other_missing}")
@@ -118,6 +194,8 @@ class Gr00tN1d7Pipeline(ModelPipeline):
                     "Checkpoint weight mismatch for "
                     f"{self.config.training.start_from_checkpoint}:\n" + "\n".join(errors)
                 )
+
+            model.action_head.assert_finite_action_head()
 
         else:
             model = self.model_class(
@@ -140,6 +218,21 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
         return model
 
+    def _warn_if_tactile_config_missing(self) -> None:
+        if not getattr(self.model_config, "use_tactile_token", False):
+            return
+        for embodiment_tag, modality_config in self.config.data.modality_configs.items():
+            state_config = modality_config.get("state") if modality_config else None
+            metadata = getattr(state_config, "metadata", {}) or {}
+            tactile_keys = metadata.get("tactile_keys", [])
+            if not tactile_keys:
+                logging.warning(
+                    "use_tactile_token=True but modality config for %s has no "
+                    "state.metadata['tactile_keys']; the tactile token will use only "
+                    "the learned null token.",
+                    embodiment_tag,
+                )
+
     def _get_statistics(
         self,
     ) -> dict[str, dict[str, dict[str, dict[str, list[float]]]]] | None:
@@ -150,6 +243,7 @@ class Gr00tN1d7Pipeline(ModelPipeline):
 
     def _create_dataset(self, save_cfg_dir: Path):
         """Create appropriate dataset based on task and mode."""
+        self._warn_if_tactile_config_missing()
         if self.config.training.start_from_checkpoint is not None:
             processor = AutoProcessor.from_pretrained(
                 self.config.training.start_from_checkpoint,

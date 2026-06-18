@@ -597,6 +597,36 @@ class LeRobotEpisodeLoader:
 
         # Use actual dataframe length (might be less than nominal)
         actual_length = min(len(df), nominal_length)
+
+        # Clamp to video length to handle parquet/video frame count mismatches
+        if self.video_path_pattern and "video" in self.modality_configs:
+            chunk_idx = episode_id // self.chunk_size
+            first_video_key = self.modality_configs["video"].modality_keys[0]
+            meta_key = self._video_key_mapping.get(first_video_key, first_video_key)
+            original_key = self.modality_meta["video"][meta_key].get(
+                "original_key", f"observation.images.{meta_key}"
+            )
+            video_filename = self.video_path_pattern.format(
+                episode_chunk=chunk_idx,
+                video_key=original_key,
+                episode_index=episode_id,
+            )
+            video_path = self.dataset_path / video_filename
+            if self.video_backend == "decord":
+                import decord as _decord
+                _vr = _decord.VideoReader(str(video_path))
+                video_frame_count = len(_vr)
+                del _vr
+            else:
+                from gr00t.utils.video_utils import _get_video_info_ffmpeg
+                video_frame_count = _get_video_info_ffmpeg(str(video_path))["nb_frames"]
+            if video_frame_count < actual_length:
+                logging.warning(
+                    f"Episode {episode_id}: video has {video_frame_count} frames but "
+                    f"parquet has {actual_length} rows; truncating to video length."
+                )
+                actual_length = video_frame_count
+
         df = df.iloc[:actual_length]
 
         # Load synchronized video data

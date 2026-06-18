@@ -98,6 +98,8 @@ class ModalityConfig:
     mean_std_embedding_keys: list[str] | None = None
     """Optional list of keys to apply mean/std normalization. If None or empty, use min/max normalization for all keys."""
     action_configs: list[ActionConfig] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    """Optional user metadata for downstream processors without adding new modalities."""
 
     def __post_init__(self):
         """Validate fields and set default values."""

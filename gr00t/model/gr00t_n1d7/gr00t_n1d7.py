@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import Any, Tuple
 
 import torch
@@ -29,10 +30,112 @@ from gr00t.model.modules.dit import AlternateVLDiT, DiT, SelfAttentionTransforme
 from gr00t.model.modules.embodiment_conditioned_mlp import (
     CategorySpecificMLP,
     MultiEmbodimentActionEncoder,
+    SinusoidalPositionalEncoding,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+def _nan_guard_enabled() -> bool:
+    return os.environ.get("GROOT_NAN_GUARD", "0").lower() in {"1", "true", "yes", "on"}
+
+
+def _nan_guard_log_forwards() -> int:
+    return int(os.environ.get("GROOT_NAN_GUARD_LOG_FORWARDS", "5"))
+
+
+def _nan_guard_expected_action_mask_sum() -> float | None:
+    value = os.environ.get("GROOT_NAN_GUARD_EXPECT_ACTION_MASK_SUM")
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _nan_guard_is_main_process() -> bool:
+    return os.environ.get("RANK", "0") == "0"
+
+
+def _nan_guard_tensor_summary(name: str, tensor: torch.Tensor) -> str:
+    shape = tuple(tensor.shape)
+    if tensor.numel() == 0:
+        return f"{name}: shape={shape} dtype={tensor.dtype} empty"
+    if not torch.is_floating_point(tensor):
+        return f"{name}: shape={shape} dtype={tensor.dtype}"
+
+    detached = tensor.detach()
+    finite = torch.isfinite(detached)
+    finite_count = int(finite.sum().item())
+    bad_count = detached.numel() - finite_count
+    if finite_count > 0:
+        finite_values = detached[finite].float()
+        min_value = float(finite_values.min().item())
+        max_value = float(finite_values.max().item())
+        mean_value = float(finite_values.mean().item())
+        std_value = float(finite_values.std(unbiased=False).item())
+    else:
+        min_value = max_value = mean_value = std_value = float("nan")
+    total_sum = float(detached.float().sum().item()) if bad_count == 0 else float("nan")
+    return (
+        f"{name}: shape={shape} dtype={tensor.dtype} finite={finite_count}/{detached.numel()} "
+        f"bad={bad_count} sum={total_sum:.6g} min={min_value:.6g} max={max_value:.6g} "
+        f"mean={mean_value:.6g} std={std_value:.6g}"
+    )
+
+
+def _nan_guard_check_tensor(name: str, tensor: torch.Tensor | None, phase: str, call_idx: int) -> None:
+    if tensor is None:
+        return
+    if not torch.is_floating_point(tensor) or tensor.numel() == 0:
+        return
+    if _nan_guard_is_main_process() and call_idx < _nan_guard_log_forwards():
+        logger.info(
+            "[GROOT_NAN_GUARD:%s forward=%d] %s",
+            phase,
+            call_idx,
+            _nan_guard_tensor_summary(name, tensor),
+        )
+    if not torch.isfinite(tensor.detach()).all():
+        raise RuntimeError(
+            f"[GROOT_NAN_GUARD:{phase}] non-finite tensor: "
+            f"{_nan_guard_tensor_summary(name, tensor)}"
+        )
+
+
+class FutureTactileDenoisingEncoder(nn.Module):
+    """Encode noisy future tactile latents with explicit diffusion timestep conditioning."""
+
+    def __init__(self, tactile_dim: int, hidden_size: int, output_dim: int):
+        super().__init__()
+        self.tactile_dim = tactile_dim
+        self.hidden_size = hidden_size
+        self.input_proj = nn.Linear(tactile_dim, hidden_size)
+        self.time_proj = nn.Linear(2 * hidden_size, hidden_size)
+        self.output_proj = nn.Linear(hidden_size, output_dim)
+        self.pos_encoding = SinusoidalPositionalEncoding(hidden_size)
+
+    def forward(self, tactile: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        if tactile.ndim != 3:
+            raise ValueError(
+                "Future tactile encoder expects [B, T, D] input, "
+                f"got shape {tuple(tactile.shape)}"
+            )
+        if tactile.shape[-1] != self.tactile_dim:
+            raise ValueError(
+                f"Future tactile dim {tactile.shape[-1]} != configured {self.tactile_dim}"
+            )
+
+        batch_size, horizon, _ = tactile.shape
+        if timesteps.dim() == 1 and timesteps.shape[0] == batch_size:
+            timesteps = timesteps.unsqueeze(1).expand(-1, horizon)
+        else:
+            raise ValueError("Expected `timesteps` to have shape [B] for future tactile encoding.")
+
+        tactile_emb = self.input_proj(tactile)
+        time_emb = self.pos_encoding(timesteps).to(dtype=tactile_emb.dtype)
+        hidden = torch.cat([tactile_emb, time_emb], dim=-1)
+        hidden = F.silu(self.time_proj(hidden))
+        return self.output_proj(hidden)
 
 
 class Gr00tN1d7ActionHead(nn.Module):
@@ -81,6 +184,64 @@ class Gr00tN1d7ActionHead(nn.Module):
             output_dim=self.action_dim,
         )
 
+        self.use_tactile_token = bool(getattr(config, "use_tactile_token", False))
+        self.tactile_dropout_prob = float(getattr(config, "tactile_dropout_prob", 0.0))
+        self.tactile_latent_dim = int(getattr(config, "tactile_latent_dim", 128))
+        if self.use_tactile_token:
+            self.tactile_projector = nn.Sequential(
+                nn.Linear(self.tactile_latent_dim, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, self.input_embedding_dim),
+            )
+            self.tactile_type_embedding = nn.Parameter(torch.zeros(1, 1, self.input_embedding_dim))
+            self.null_tactile_token = nn.Parameter(torch.zeros(1, 1, self.input_embedding_dim))
+            self.reset_tactile_token_parameters()
+
+        self.use_future_tactile_aux = bool(getattr(config, "use_future_tactile_aux", False))
+        self.future_tactile_loss_weight = float(
+            getattr(config, "future_tactile_loss_weight", 0.5)
+        )
+        self.future_tactile_dim = int(getattr(config, "future_tactile_dim", 128))
+        self.future_tactile_horizon = int(getattr(config, "future_tactile_horizon", 16))
+        if self.use_future_tactile_aux:
+            self.future_tactile_decoder = CategorySpecificMLP(
+                num_categories=config.max_num_embodiments,
+                input_dim=self.hidden_size,
+                hidden_dim=self.hidden_size,
+                output_dim=self.future_tactile_dim,
+            )
+
+        self.use_joint_tactile_denoising = bool(
+            getattr(config, "use_joint_tactile_denoising", False)
+        )
+        if self.use_future_tactile_aux and self.use_joint_tactile_denoising:
+            raise ValueError(
+                "use_future_tactile_aux and use_joint_tactile_denoising are mutually exclusive"
+            )
+        if self.use_joint_tactile_denoising and not self.use_tactile_token:
+            raise ValueError("A5 joint tactile denoising requires use_tactile_token=True")
+        self.joint_tactile_loss_weight = float(
+            getattr(config, "joint_tactile_loss_weight", 0.5)
+        )
+        self.joint_tactile_dim = int(getattr(config, "joint_tactile_dim", 128))
+        self.joint_tactile_horizon = int(getattr(config, "joint_tactile_horizon", 16))
+        if self.use_joint_tactile_denoising:
+            self.future_tactile_encoder = FutureTactileDenoisingEncoder(
+                tactile_dim=self.joint_tactile_dim,
+                hidden_size=self.input_embedding_dim,
+                output_dim=self.input_embedding_dim,
+            )
+            self.joint_tactile_velocity_decoder = nn.Sequential(
+                nn.Linear(self.hidden_size, self.hidden_size),
+                nn.GELU(),
+                nn.Linear(self.hidden_size, self.joint_tactile_dim),
+            )
+            self.action_type_embedding = nn.Parameter(torch.zeros(1, 1, self.input_embedding_dim))
+            self.joint_future_tactile_type_embedding = nn.Parameter(
+                torch.zeros(1, 1, self.input_embedding_dim)
+            )
+            self.reset_joint_tactile_denoising_parameters()
+
         self.vlln = (
             nn.LayerNorm(config.backbone_embedding_dim) if config.use_vlln else nn.Identity()
         )
@@ -104,6 +265,49 @@ class Gr00tN1d7ActionHead(nn.Module):
             config.tune_projector, config.tune_diffusion_model, config.tune_vlln
         )
 
+    @staticmethod
+    def _init_mlp(module: nn.Module) -> None:
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def reset_tactile_token_parameters(self) -> None:
+        with torch.no_grad():
+            nn.init.normal_(self.tactile_type_embedding, mean=0.0, std=0.02)
+            nn.init.normal_(self.null_tactile_token, mean=0.0, std=0.02)
+            self._init_mlp(self.tactile_projector)
+
+    def reset_future_tactile_parameters(self) -> None:
+        with torch.no_grad():
+            for m in self.future_tactile_decoder.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif hasattr(m, "W") and isinstance(m.W, nn.Parameter):
+                    nn.init.normal_(m.W, mean=0.0, std=0.02)
+                    if hasattr(m, "b") and isinstance(m.b, nn.Parameter):
+                        nn.init.zeros_(m.b)
+
+    def reset_joint_tactile_denoising_parameters(self) -> None:
+        with torch.no_grad():
+            nn.init.normal_(self.action_type_embedding, mean=0.0, std=0.02)
+            nn.init.normal_(self.joint_future_tactile_type_embedding, mean=0.0, std=0.02)
+            self._init_mlp(self.future_tactile_encoder)
+            self._init_mlp(self.joint_tactile_velocity_decoder)
+
+    def assert_finite_action_head(self) -> None:
+        for name, p in self.named_parameters():
+            if not torch.isfinite(p.data).all():
+                bad = int((~torch.isfinite(p.data)).sum().item())
+                total = p.data.numel()
+                raise RuntimeError(
+                    f"Non-finite values in action_head.{name}: "
+                    f"{bad}/{total} elements are NaN/Inf"
+                )
+
     def set_trainable_parameters(
         self, tune_projector: bool, tune_diffusion_model: bool, tune_vlln: bool
     ):
@@ -116,6 +320,17 @@ class Gr00tN1d7ActionHead(nn.Module):
             self.state_encoder.requires_grad_(False)
             self.action_encoder.requires_grad_(False)
             self.action_decoder.requires_grad_(False)
+            if self.use_tactile_token:
+                self.tactile_projector.requires_grad_(False)
+                self.tactile_type_embedding.requires_grad_(False)
+                self.null_tactile_token.requires_grad_(False)
+            if self.use_future_tactile_aux:
+                self.future_tactile_decoder.requires_grad_(False)
+            if self.use_joint_tactile_denoising:
+                self.future_tactile_encoder.requires_grad_(False)
+                self.joint_tactile_velocity_decoder.requires_grad_(False)
+                self.action_type_embedding.requires_grad_(False)
+                self.joint_future_tactile_type_embedding.requires_grad_(False)
             if self.config.add_pos_embed:
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
@@ -145,6 +360,13 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.state_encoder.eval()
                 self.action_encoder.eval()
                 self.action_decoder.eval()
+                if self.use_tactile_token:
+                    self.tactile_projector.eval()
+                if self.use_future_tactile_aux:
+                    self.future_tactile_decoder.eval()
+                if self.use_joint_tactile_denoising:
+                    self.future_tactile_encoder.eval()
+                    self.joint_tactile_velocity_decoder.eval()
                 if self.config.add_pos_embed:
                     self.position_embedding.eval()
             if not self.tune_diffusion_model:
@@ -164,6 +386,115 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_features = self.vl_self_attention(backbone_features)
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
+
+    def _encode_tactile_features(
+        self, action_input: BatchFeature, batch_size: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor | None:
+        if not self.use_tactile_token:
+            return None
+
+        if "tactile" in action_input and action_input.tactile is not None:
+            tactile = action_input.tactile.to(device=device, dtype=dtype)
+            if tactile.ndim == 3:
+                tactile = tactile.reshape(tactile.shape[0], -1)
+            elif tactile.ndim == 1:
+                tactile = tactile.unsqueeze(0)
+            assert tactile.shape[-1] == self.tactile_latent_dim, (
+                f"Tactile latent dim {tactile.shape[-1]} != configured {self.tactile_latent_dim}"
+            )
+            tactile_features = self.tactile_projector(tactile).unsqueeze(1)
+            tactile_features = tactile_features + self.tactile_type_embedding.to(
+                device=device, dtype=tactile_features.dtype
+            )
+        else:
+            tactile_features = self.null_tactile_token.to(device=device, dtype=dtype).expand(
+                batch_size, -1, -1
+            )
+
+        if self.training and self.tactile_dropout_prob > 0:
+            do_dropout = (
+                torch.rand(batch_size, device=device) < self.tactile_dropout_prob
+            )[:, None, None]
+            null_token = self.null_tactile_token.to(
+                device=device, dtype=tactile_features.dtype
+            ).expand_as(tactile_features)
+            tactile_features = torch.where(do_dropout, null_token, tactile_features)
+
+        return tactile_features
+
+    def _add_sequence_position_embedding(
+        self, features: torch.Tensor, device: torch.device
+    ) -> torch.Tensor:
+        if not self.config.add_pos_embed:
+            return features
+        pos_ids = torch.arange(features.shape[1], dtype=torch.long, device=device)
+        pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
+        return features + pos_embs
+
+    def _build_dit_sequence(
+        self,
+        state_features: torch.Tensor,
+        tactile_features: torch.Tensor | None,
+        action_features: torch.Tensor,
+        future_tactile_features: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, slice, slice | None]:
+        parts = [state_features]
+        pos = state_features.shape[1]
+
+        if tactile_features is not None:
+            parts.append(tactile_features)
+            pos += tactile_features.shape[1]
+
+        action_slice = slice(pos, pos + action_features.shape[1])
+        parts.append(action_features)
+        pos += action_features.shape[1]
+
+        future_tactile_slice = None
+        if future_tactile_features is not None:
+            future_tactile_slice = slice(pos, pos + future_tactile_features.shape[1])
+            parts.append(future_tactile_features)
+
+        return torch.cat(parts, dim=1), action_slice, future_tactile_slice
+
+    def _encode_noisy_future_tactile(
+        self,
+        future_tactile_target: torch.Tensor | None,
+        t: torch.Tensor,
+        t_discretized: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, int]:
+        if not self.use_joint_tactile_denoising:
+            return None, None, None, 0
+        if future_tactile_target is None:
+            raise RuntimeError(
+                "use_joint_tactile_denoising=True but the batch does not contain "
+                "future_tactile. Check the A5 modality config "
+                "state.metadata['future_tactile_keys'] and processor output."
+            )
+
+        future_tactile_target = future_tactile_target.to(device=device, dtype=dtype)
+        h = min(future_tactile_target.shape[1], self.joint_tactile_horizon)
+        future_tactile_target = future_tactile_target[:, :h, :]
+        if future_tactile_target.shape[-1] != self.joint_tactile_dim:
+            raise ValueError(
+                f"Future tactile dim {future_tactile_target.shape[-1]} != configured "
+                f"{self.joint_tactile_dim}"
+            )
+
+        noise = torch.randn_like(future_tactile_target)
+        noisy_future_tactile = (1 - t) * noise + t * future_tactile_target
+        future_tactile_velocity = future_tactile_target - noise
+        future_tactile_features = self.future_tactile_encoder(
+            noisy_future_tactile, t_discretized
+        )
+        future_tactile_features = future_tactile_features + self.joint_future_tactile_type_embedding.to(
+            device=device, dtype=future_tactile_features.dtype
+        )
+        future_tactile_features = self._add_sequence_position_embedding(
+            future_tactile_features, device
+        )
+        return future_tactile_features, future_tactile_velocity, noisy_future_tactile, h
 
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
@@ -201,6 +532,9 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         # Embed state.
         state_features = self.state_encoder(action_input.state, embodiment_id)
+        tactile_features = self._encode_tactile_features(
+            action_input, state_features.shape[0], device, state_features.dtype
+        )
 
         # Dropout state features (training only): zero out dropped states.
         if self.training and self.state_dropout_prob > 0:
@@ -223,15 +557,26 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Convert (continuous) t -> discrete if needed
         t_discretized = (t[:, 0, 0] * self.num_timestep_buckets).long()
         action_features = self.action_encoder(noisy_trajectory, t_discretized, embodiment_id)
+        if self.use_joint_tactile_denoising:
+            action_features = action_features + self.action_type_embedding.to(
+                device=device, dtype=action_features.dtype
+            )
+        action_features = self._add_sequence_position_embedding(action_features, device)
 
-        # Maybe add position embedding.
-        if self.config.add_pos_embed:
-            pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-            pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-            action_features = action_features + pos_embs
+        future_tactile_features, future_tactile_velocity, noisy_future_tactile, future_tactile_h = (
+            self._encode_noisy_future_tactile(
+                getattr(action_input, "future_tactile", None),
+                t,
+                t_discretized,
+                device,
+                action_features.dtype,
+            )
+        )
 
-        # Join vision, language, state and action embedding along sequence dimension.
-        sa_embs = torch.cat((state_features, action_features), dim=1)
+        # Join vision, language, state, optional tactile, action, and optional future tactile.
+        sa_embs, action_slice, future_tactile_slice = self._build_dit_sequence(
+            state_features, tactile_features, action_features, future_tactile_features
+        )
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -255,21 +600,137 @@ class Gr00tN1d7ActionHead(nn.Module):
                 return_all_hidden_states=True,
             )
 
-        pred = self.action_decoder(model_output, embodiment_id)
-        pred_actions = pred[:, -actions.shape[1] :]
+        action_hidden = model_output[:, action_slice, :]
+        pred_actions = self.action_decoder(action_hidden, embodiment_id)
+        pred_future_tactile_velocity = None
+        if self.use_joint_tactile_denoising:
+            if future_tactile_slice is None:
+                raise RuntimeError("Internal error: missing future tactile slice for A5")
+            future_tactile_hidden = model_output[:, future_tactile_slice, :]
+            pred_future_tactile_velocity = self.joint_tactile_velocity_decoder(
+                future_tactile_hidden
+            )
 
         # Slice out only the action portion of pred and target.
         action_mask = action_input.action_mask
+        if _nan_guard_enabled():
+            call_idx = getattr(self, "_nan_guard_forward_calls", 0)
+            self._nan_guard_forward_calls = call_idx + 1
+            if pred_actions.shape != velocity.shape or pred_actions.shape != action_mask.shape:
+                raise RuntimeError(
+                    "[GROOT_NAN_GUARD:forward] action tensor shape mismatch: "
+                    f"pred_actions={tuple(pred_actions.shape)} velocity={tuple(velocity.shape)} "
+                    f"action_mask={tuple(action_mask.shape)}"
+                )
+            expected_per_sample = _nan_guard_expected_action_mask_sum()
+            if expected_per_sample is not None:
+                expected = float(action_mask.shape[0]) * expected_per_sample
+                actual = float(action_mask.detach().float().sum().item())
+                if abs(actual - expected) > 1e-3:
+                    raise RuntimeError(
+                        "[GROOT_NAN_GUARD:forward] unexpected action_mask sum: "
+                        f"actual={actual:.6g} expected={expected:.6g} "
+                        f"batch={action_mask.shape[0]} per_sample={expected_per_sample:.6g}"
+                    )
+            for name, tensor in (
+                ("actions", actions),
+                ("noise", noise),
+                ("velocity", velocity),
+                ("noisy_trajectory", noisy_trajectory),
+                ("state_features", state_features),
+                ("tactile_features", tactile_features),
+                ("action_features", action_features),
+                ("noisy_future_tactile", noisy_future_tactile),
+                ("future_tactile_velocity", future_tactile_velocity),
+                ("future_tactile_features", future_tactile_features),
+                ("sa_embs", sa_embs),
+                ("model_output", model_output),
+                ("pred_actions", pred_actions),
+                ("pred_future_tactile_velocity", pred_future_tactile_velocity),
+                ("action_mask", action_mask),
+            ):
+                _nan_guard_check_tensor(name, tensor, "forward", call_idx)
+
         action_loss = F.mse_loss(pred_actions, velocity, reduction="none") * action_mask
         loss = action_loss.sum() / (action_mask.sum() + 1e-6)
+        if _nan_guard_enabled():
+            _nan_guard_check_tensor("action_loss", action_loss, "loss", call_idx)
+            _nan_guard_check_tensor("loss", loss, "loss", call_idx)
+            if float(action_mask.detach().float().sum().item()) > 0 and float(loss.detach().float().item()) == 0.0:
+                logger.warning(
+                    "[GROOT_NAN_GUARD:loss forward=%d] loss is exactly 0.0 with nonzero action_mask; %s; %s; %s",
+                    call_idx,
+                    _nan_guard_tensor_summary("pred_actions", pred_actions),
+                    _nan_guard_tensor_summary("velocity", velocity),
+                    _nan_guard_tensor_summary("action_mask", action_mask),
+                )
 
-        return {
+        future_tactile_loss = None
+        future_tactile_pred = None
+        future_tactile_target = getattr(action_input, "future_tactile", None)
+        if self.use_future_tactile_aux and future_tactile_target is None:
+            raise RuntimeError(
+                "use_future_tactile_aux=True but the batch does not contain "
+                "future_tactile. Check the A3/A4 modality config "
+                "state.metadata['future_tactile_keys'], the processor output, "
+                "and the collated training batch; otherwise the auxiliary head "
+                "would silently train as plain A2/A1."
+            )
+        if self.use_future_tactile_aux:
+            future_tactile_target = future_tactile_target.to(
+                device=model_output.device, dtype=model_output.dtype
+            )
+            h = min(future_tactile_target.shape[1], self.future_tactile_horizon)
+            future_tactile_target = future_tactile_target[:, :h, :]
+            assert future_tactile_target.shape[-1] == self.future_tactile_dim, (
+                f"Future tactile dim {future_tactile_target.shape[-1]} != configured "
+                f"{self.future_tactile_dim}"
+            )
+            future_tactile_pred = self.future_tactile_decoder(action_hidden, embodiment_id)[:, :h, :]
+            temporal_mask = action_mask[:, :h, :1].to(
+                device=future_tactile_pred.device, dtype=future_tactile_pred.dtype
+            )
+            temporal_mask = temporal_mask.expand_as(future_tactile_pred)
+            future_tactile_loss = (
+                F.mse_loss(future_tactile_pred, future_tactile_target, reduction="none")
+                * temporal_mask
+            ).sum() / (temporal_mask.sum() + 1e-6)
+            loss = loss + self.future_tactile_loss_weight * future_tactile_loss
+
+        joint_tactile_loss = None
+        if self.use_joint_tactile_denoising:
+            temporal_mask = action_mask[:, :future_tactile_h, :1].to(
+                device=pred_future_tactile_velocity.device,
+                dtype=pred_future_tactile_velocity.dtype,
+            )
+            temporal_mask = temporal_mask.expand_as(pred_future_tactile_velocity)
+            joint_tactile_loss = (
+                F.mse_loss(
+                    pred_future_tactile_velocity,
+                    future_tactile_velocity,
+                    reduction="none",
+                )
+                * temporal_mask
+            ).sum() / (temporal_mask.sum() + 1e-6)
+            loss = loss + self.joint_tactile_loss_weight * joint_tactile_loss
+            if _nan_guard_enabled():
+                _nan_guard_check_tensor("joint_tactile_loss", joint_tactile_loss, "loss", call_idx)
+
+        output = {
             "loss": loss,
             "action_loss": action_loss,
             "action_mask": action_mask,
             "backbone_features": vl_embeds,
             "state_features": state_features,
+            "tactile_features": tactile_features,
         }
+        if future_tactile_loss is not None:
+            output["future_tactile_loss"] = future_tactile_loss
+            output["future_tactile_pred"] = future_tactile_pred
+        if joint_tactile_loss is not None:
+            output["joint_tactile_loss"] = joint_tactile_loss
+            output["pred_future_tactile_velocity"] = pred_future_tactile_velocity
+        return output
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
@@ -303,16 +764,26 @@ class Gr00tN1d7ActionHead(nn.Module):
         # Reshape state from [B, state_history_length, max_state_dim] to [B, 1, state_history_length * max_state_dim]
         state = state.view(state.shape[0], 1, -1)
 
-        # Embed state.
+        # Embed state and optional tactile token.
         state_features = self.state_encoder(state, embodiment_id)
+        tactile_features = self._encode_tactile_features(
+            action_input, state_features.shape[0], vl_embeds.device, state_features.dtype
+        )
 
-        return BatchFeature(data={"backbone_features": vl_embeds, "state_features": state_features})
+        return BatchFeature(
+            data={
+                "backbone_features": vl_embeds,
+                "state_features": state_features,
+                "tactile_features": tactile_features,
+            }
+        )
 
     @torch.no_grad()
     def get_action_with_features(
         self,
         backbone_features: torch.Tensor,
         state_features: torch.Tensor,
+        tactile_features: torch.Tensor | None,
         embodiment_id: torch.Tensor,
         backbone_output: BatchFeature,
         action_input: BatchFeature,
@@ -328,6 +799,8 @@ class Gr00tN1d7ActionHead(nn.Module):
             backbone_output: Output from the backbone model
         """
         vl_embeds = backbone_features
+        options = options or {}
+        return_future_tactile = bool(options.get("return_future_tactile", False))
 
         # Set initial actions as the sampled noise.
         batch_size = vl_embeds.shape[0]
@@ -340,6 +813,13 @@ class Gr00tN1d7ActionHead(nn.Module):
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
+        future_tactile_pred = None
+        if self.use_joint_tactile_denoising:
+            future_tactile_pred = torch.randn(
+                size=(batch_size, self.joint_tactile_horizon, self.joint_tactile_dim),
+                dtype=vl_embeds.dtype,
+                device=device,
+            )
 
         if "action" in action_input:
             # If action in input when doing get action, it means we want to use RTC.
@@ -380,6 +860,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             ] = ramp[None, :, None].to(device)
 
         # Run denoising steps.
+        final_action_hidden = None
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
@@ -389,14 +870,34 @@ class Gr00tN1d7ActionHead(nn.Module):
                 size=(batch_size,), fill_value=t_discretized, device=device
             )
             action_features = self.action_encoder(actions, timesteps_tensor, embodiment_id)
-            # Add position embedding.
-            if self.config.add_pos_embed:
-                pos_ids = torch.arange(action_features.shape[1], dtype=torch.long, device=device)
-                pos_embs = self.position_embedding(pos_ids).unsqueeze(0)
-                action_features = action_features + pos_embs
+            if self.use_joint_tactile_denoising:
+                action_features = action_features + self.action_type_embedding.to(
+                    device=device, dtype=action_features.dtype
+                )
+            action_features = self._add_sequence_position_embedding(action_features, device)
 
-            # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+            future_tactile_features = None
+            if self.use_joint_tactile_denoising:
+                future_tactile_features = self.future_tactile_encoder(
+                    future_tactile_pred, timesteps_tensor
+                )
+                future_tactile_features = (
+                    future_tactile_features
+                    + self.joint_future_tactile_type_embedding.to(
+                        device=device, dtype=future_tactile_features.dtype
+                    )
+                )
+                future_tactile_features = self._add_sequence_position_embedding(
+                    future_tactile_features, device
+                )
+
+            # Join vision, language, state, optional tactile, action, and optional future tactile.
+            sa_embs, action_slice, future_tactile_slice = self._build_dit_sequence(
+                state_features,
+                tactile_features,
+                action_features,
+                future_tactile_features,
+            )
 
             # Run model forward.
             if self.config.use_alternate_vl_dit:
@@ -413,20 +914,60 @@ class Gr00tN1d7ActionHead(nn.Module):
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
                 )
-            pred = self.action_decoder(model_output, embodiment_id)
-
-            pred_velocity = pred[:, -self.action_horizon :]
+            action_hidden = model_output[:, action_slice, :]
+            final_action_hidden = action_hidden
+            pred_velocity = self.action_decoder(action_hidden, embodiment_id)
+            pred_future_tactile_velocity = None
+            if self.use_joint_tactile_denoising:
+                if future_tactile_slice is None:
+                    raise RuntimeError("Internal error: missing future tactile slice for A5")
+                future_tactile_hidden = model_output[:, future_tactile_slice, :]
+                pred_future_tactile_velocity = self.joint_tactile_velocity_decoder(
+                    future_tactile_hidden
+                )
 
             # Update actions using euler integration.
             actions = actions + dt * pred_velocity * vel_strength
+            if self.use_joint_tactile_denoising:
+                future_tactile_pred = future_tactile_pred + dt * pred_future_tactile_velocity
 
-        return BatchFeature(
-            data={
-                "action_pred": actions,
-                "backbone_features": vl_embeds,
-                "state_features": state_features,
-            }
-        )
+        output = {
+            "action_pred": actions,
+            "backbone_features": vl_embeds,
+            "state_features": state_features,
+            "tactile_features": tactile_features,
+        }
+
+        future_tactile_target = getattr(action_input, "future_tactile", None)
+        future_tactile_h = None
+        if future_tactile_target is not None:
+            future_tactile_h = min(
+                int(future_tactile_target.shape[1]),
+                int(getattr(self, "future_tactile_horizon", future_tactile_target.shape[1])),
+            )
+        if future_tactile_h is None and self.use_joint_tactile_denoising:
+            future_tactile_h = self.joint_tactile_horizon
+
+        if return_future_tactile and self.use_future_tactile_aux:
+            if final_action_hidden is None:
+                raise RuntimeError("Internal error: no action hidden state for future tactile eval")
+            h = future_tactile_h if future_tactile_h is not None else self.future_tactile_horizon
+            future_tactile_pred = self.future_tactile_decoder(final_action_hidden, embodiment_id)[
+                :, :h, :
+            ]
+
+        if return_future_tactile and future_tactile_pred is not None:
+            output["future_tactile_pred"] = future_tactile_pred
+        if return_future_tactile and future_tactile_target is not None:
+            h = future_tactile_h if future_tactile_h is not None else future_tactile_target.shape[1]
+            future_tactile_target = future_tactile_target[:, :h, :].to(
+                device=actions.device, dtype=actions.dtype
+            )
+            output["future_tactile_target"] = future_tactile_target
+            output["future_tactile_delta_indices"] = list(range(h))
+            if h > 0:
+                output["current_tactile"] = future_tactile_target[:, 0, :]
+        return BatchFeature(data=output)
 
     @torch.no_grad()
     def get_action(
@@ -454,6 +995,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         return self.get_action_with_features(
             backbone_features=features.backbone_features,
             state_features=features.state_features,
+            tactile_features=features.tactile_features,
             embodiment_id=action_input.embodiment_id,
             backbone_output=backbone_output,
             action_input=action_input,

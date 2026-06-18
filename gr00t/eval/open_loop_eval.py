@@ -276,6 +276,9 @@ class ArgsConfig:
     denoising_steps: int = 4
     """Number of denoising steps to use."""
 
+    video_backend: str = "decord"
+    """Video decoding backend for loading evaluation trajectories."""
+
     save_plot_path: str | None = None
     """Path to save the plot to."""
 
@@ -326,7 +329,7 @@ def main(args: ArgsConfig):
     dataset = LeRobotEpisodeLoader(
         dataset_path=args.dataset_path,
         modality_configs=modality,
-        video_backend="torchcodec",
+        video_backend=args.video_backend,
         video_backend_kwargs=None,
     )
 
@@ -342,6 +345,11 @@ def main(args: ArgsConfig):
             continue
 
         logging.info(f"Running trajectory: {traj_id}")
+        save_plot_path = args.save_plot_path
+        if save_plot_path is not None:
+            save_plot = Path(save_plot_path)
+            if save_plot.suffix == "":
+                save_plot_path = str(save_plot / f"traj_{traj_id}.jpeg")
         mse, mae = evaluate_single_trajectory(
             policy,
             dataset,
@@ -350,7 +358,7 @@ def main(args: ArgsConfig):
             args.modality_keys,
             steps=args.steps,
             action_horizon=args.action_horizon,
-            save_plot_path=args.save_plot_path,
+            save_plot_path=save_plot_path,
         )
         logging.info(f"MSE for trajectory {traj_id}: {mse}, MAE: {mae}")
         all_mse.append(mse)

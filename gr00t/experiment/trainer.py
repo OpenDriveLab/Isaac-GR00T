@@ -41,6 +41,110 @@ from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalPrediction
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _nan_guard_enabled() -> bool:
+    return _env_flag("GROOT_NAN_GUARD")
+
+
+def _nan_guard_log_steps() -> int:
+    return int(os.environ.get("GROOT_NAN_GUARD_LOG_STEPS", "5"))
+
+
+def _nan_guard_expected_action_mask_sum() -> float | None:
+    value = os.environ.get("GROOT_NAN_GUARD_EXPECT_ACTION_MASK_SUM")
+    if value is None or value == "":
+        return None
+    return float(value)
+
+
+def _nan_guard_param_targets() -> tuple[str, ...]:
+    value = os.environ.get("GROOT_NAN_GUARD_PARAM_TARGETS", "action_head")
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _is_main_process() -> bool:
+    return os.environ.get("RANK", "0") == "0"
+
+
+def _tensor_summary(name: str, tensor: torch.Tensor) -> str:
+    shape = tuple(tensor.shape)
+    if tensor.numel() == 0:
+        return f"{name}: shape={shape} dtype={tensor.dtype} empty"
+    if not torch.is_floating_point(tensor):
+        return f"{name}: shape={shape} dtype={tensor.dtype}"
+
+    detached = tensor.detach()
+    finite = torch.isfinite(detached)
+    finite_count = int(finite.sum().item())
+    bad_count = detached.numel() - finite_count
+    if finite_count > 0:
+        finite_values = detached[finite].float()
+        min_value = float(finite_values.min().item())
+        max_value = float(finite_values.max().item())
+        mean_value = float(finite_values.mean().item())
+        std_value = float(finite_values.std(unbiased=False).item())
+    else:
+        min_value = max_value = mean_value = std_value = float("nan")
+    total_sum = float(detached.float().sum().item()) if bad_count == 0 else float("nan")
+    return (
+        f"{name}: shape={shape} dtype={tensor.dtype} finite={finite_count}/{detached.numel()} "
+        f"bad={bad_count} sum={total_sum:.6g} min={min_value:.6g} max={max_value:.6g} "
+        f"mean={mean_value:.6g} std={std_value:.6g}"
+    )
+
+
+def _raise_if_nonfinite(name: str, tensor: torch.Tensor, phase: str) -> None:
+    if not torch.is_floating_point(tensor) or tensor.numel() == 0:
+        return
+    if not torch.isfinite(tensor.detach()).all():
+        raise RuntimeError(
+            f"[GROOT_NAN_GUARD:{phase}] non-finite tensor: {_tensor_summary(name, tensor)}"
+        )
+
+
+def _log_tensor(name: str, tensor: torch.Tensor, phase: str, step: int) -> None:
+    if _is_main_process() and step < _nan_guard_log_steps():
+        logging.info("[GROOT_NAN_GUARD:%s step=%d] %s", phase, step, _tensor_summary(name, tensor))
+
+
+def _scan_named_tensors(
+    named_tensors,
+    phase: str,
+    step: int,
+    *,
+    log_matches: bool = False,
+) -> None:
+    targets = _nan_guard_param_targets()
+    for name, tensor in named_tensors:
+        if tensor is None:
+            continue
+        if targets and not any(target in name for target in targets):
+            continue
+        _raise_if_nonfinite(name, tensor, phase)
+        if log_matches:
+            _log_tensor(name, tensor, phase, step)
+
+
+class NanGuardCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        if not _nan_guard_enabled():
+            return
+        model = kwargs.get("model")
+        if model is None:
+            return
+        _scan_named_tensors(
+            ((name, param) for name, param in model.named_parameters() if param.requires_grad),
+            "post-optimizer-params",
+            state.global_step,
+        )
+
+
 class ProfCallback(TrainerCallback):
     def __init__(self, prof):
         self.prof = prof
@@ -210,6 +314,14 @@ class Gr00tTrainer(Trainer):
             **kwargs,
             # compute_metrics=partial(compute_eval_accuracy, action_offset=self.action_offset),
         )
+        if _nan_guard_enabled():
+            self.add_callback(NanGuardCallback())
+            if _is_main_process():
+                logging.info(
+                    "GROOT_NAN_GUARD enabled: expected_action_mask_sum=%s param_targets=%s",
+                    _nan_guard_expected_action_mask_sum(),
+                    _nan_guard_param_targets(),
+                )
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         # Hide epoch from logged metrics as it's misleading for Iterable datasets.
@@ -245,8 +357,9 @@ class Gr00tTrainer(Trainer):
         data_collator = self._get_collator_with_removed_columns(
             data_collator, description="training"
         )
-        # Use persistent workers for sharded dataset if num_workers is greater than 0
-        persistent_workers = self.args.dataloader_num_workers > 0
+        persistent_workers = self.args.dataloader_num_workers > 0 and _env_flag(
+            "GROOT_DATALOADER_PERSISTENT_WORKERS", default=True
+        )
 
         dataloader_params = {
             "batch_size": self._train_batch_size,
@@ -306,6 +419,9 @@ class Gr00tTrainer(Trainer):
         *and* model outputs, we calculate accuracy and push it to the logger.
         """
 
+        if _nan_guard_enabled():
+            self._nan_guard_check_batch(inputs)
+
         # Use parent implementation to preserve built-in functionality.
         loss, outputs = super().compute_loss(
             model,
@@ -322,6 +438,19 @@ class Gr00tTrainer(Trainer):
 
         # Record last loss for testing purposes.
         self.loss = loss
+
+        if self.state.global_step % self.args.logging_steps == 0 and model.training and outputs is not None:
+            for loss_name in ("future_tactile_loss", "joint_tactile_loss"):
+                if loss_name not in outputs:
+                    continue
+                aux_loss = outputs[loss_name]
+                if torch.is_tensor(aux_loss):
+                    aux_tensor = aux_loss.detach().to(device=loss.device).reshape(1)
+                else:
+                    aux_tensor = torch.tensor([float(aux_loss)], device=loss.device)
+                aux_mean = self._nested_gather(aux_tensor).mean().item()
+                if self.args.local_rank in (-1, 0):
+                    self.log({loss_name: aux_mean})
 
         # --------------------------------------------------------------
         # Accuracy calculation
@@ -365,3 +494,64 @@ class Gr00tTrainer(Trainer):
                 )
 
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(self, model, inputs, num_items_in_batch=None):  # type: ignore[override]
+        if _nan_guard_enabled():
+            _scan_named_tensors(
+                ((name, param) for name, param in model.named_parameters() if param.requires_grad),
+                "pre-forward-params",
+                self.state.global_step,
+            )
+
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+
+        if _nan_guard_enabled():
+            _scan_named_tensors(
+                (
+                    (f"{name}.grad", param.grad)
+                    for name, param in model.named_parameters()
+                    if param.requires_grad
+                ),
+                "post-backward-grads",
+                self.state.global_step,
+            )
+            _scan_named_tensors(
+                ((name, param) for name, param in model.named_parameters() if param.requires_grad),
+                "post-backward-params",
+                self.state.global_step,
+            )
+        return loss
+
+    def _nan_guard_check_batch(self, inputs: dict[str, Any]) -> None:
+        batch = inputs.get("inputs", inputs)
+        if not isinstance(batch, dict):
+            return
+
+        step = self.state.global_step
+        for key in ("state", "action", "tactile", "future_tactile", "action_mask"):
+            tensor = batch.get(key)
+            if torch.is_tensor(tensor):
+                _raise_if_nonfinite(f"batch.{key}", tensor, "batch")
+                _log_tensor(f"batch.{key}", tensor, "batch", step)
+
+        action = batch.get("action")
+        action_mask = batch.get("action_mask")
+        if not (torch.is_tensor(action) and torch.is_tensor(action_mask)):
+            raise RuntimeError("[GROOT_NAN_GUARD:batch] missing action or action_mask in training batch")
+        if action.shape != action_mask.shape:
+            raise RuntimeError(
+                "[GROOT_NAN_GUARD:batch] action/action_mask shape mismatch: "
+                f"action={tuple(action.shape)} action_mask={tuple(action_mask.shape)}"
+            )
+
+        expected_per_sample = _nan_guard_expected_action_mask_sum()
+        if expected_per_sample is None:
+            return
+        expected = float(action.shape[0]) * expected_per_sample
+        actual = float(action_mask.detach().float().sum().item())
+        if abs(actual - expected) > 1e-3:
+            raise RuntimeError(
+                "[GROOT_NAN_GUARD:batch] unexpected action_mask sum: "
+                f"actual={actual:.6g} expected={expected:.6g} batch={action.shape[0]} "
+                f"per_sample={expected_per_sample:.6g}"
+            )

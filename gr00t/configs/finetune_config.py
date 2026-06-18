@@ -38,6 +38,9 @@ class FinetuneConfig:
     embodiment_tag: str
     """Embodiment tag (name or value, case-insensitive). See EmbodimentTag for known tags."""
 
+    video_backend: str = "torchcodec"
+    """Video decoding backend for dataset loading. Use ffmpeg if torchcodec is unavailable or incompatible."""
+
     modality_config_path: str | None = None
     """
     Path to a Python file defining the modality configuration for the given embodiment. 
@@ -52,7 +55,7 @@ class FinetuneConfig:
     """If True, fine-tune the visual encoder (e.g., ViT or CNN backbone)."""
 
     tune_projector: bool = True
-    """If True, fine-tune the multimodal projector layers that map vision/language features to a shared space."""
+    """If True, fine-tune GR00T action-head encoders, decoders, and embeddings. This is not a Qwen VLM projector switch."""
 
     tune_diffusion_model: bool = True
     """If True, fine-tune the diffusion-based action decoder (if present in the model)."""
@@ -61,6 +64,39 @@ class FinetuneConfig:
     """
     Dropout probability applied to state inputs for regularization during training.
     """
+
+    use_tactile_token: bool = False
+    """If True, split tactile state keys into a separate GR00T action-head token."""
+
+    tactile_latent_dim: int = 128
+    """Concatenated tactile latent dimension, e.g. left 64D + right 64D."""
+
+    tactile_dropout_prob: float = 0.0
+    """Dropout probability for replacing the tactile token with a learned null token."""
+
+    use_future_tactile_aux: bool = False
+    """If True, add an auxiliary loss that predicts future tactile latents."""
+
+    future_tactile_loss_weight: float = 0.5
+    """Weight for the future tactile auxiliary prediction loss."""
+
+    future_tactile_dim: int = 128
+    """Concatenated future tactile latent dimension, e.g. left 64D + right 64D."""
+
+    future_tactile_horizon: int = 16
+    """Number of future tactile steps predicted by the auxiliary head."""
+
+    use_joint_tactile_denoising: bool = False
+    """If True, jointly denoise action and future tactile latent tokens."""
+
+    joint_tactile_loss_weight: float = 0.5
+    """Weight for the A5 joint future tactile velocity loss."""
+
+    joint_tactile_dim: int = 128
+    """Concatenated future tactile latent dimension for joint denoising."""
+
+    joint_tactile_horizon: int = 16
+    """Number of future tactile steps jointly denoised with the action horizon."""
 
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
@@ -110,6 +146,12 @@ class FinetuneConfig:
 
     gradient_accumulation_steps: int = 1
     """Number of forward passes to accumulate before performing a backward/update step."""
+
+    deepspeed_stage: int = 2
+    """DeepSpeed ZeRO stage. Use stage 3 for full VLM fine-tuning."""
+
+    gradient_checkpointing: bool = False
+    """If True, enable gradient checkpointing to reduce activation memory."""
 
     output_dir: str = "./outputs"
     """Directory where model checkpoints, logs, and outputs are saved."""

@@ -118,6 +118,26 @@ class Gr00tN1d7Config(PretrainedConfig):
     exclude_state: bool = False  # Zero out all state inputs (ablation)
     use_mean_std: bool = False  # Use mean/std normalization instead of min/max
 
+    # A2 tactile token parameters. Tactile latents stay in the state modality at
+    # the data-loader level, then the processor splits them into a separate token.
+    use_tactile_token: bool = False
+    tactile_latent_dim: int = 128
+    tactile_dropout_prob: float = 0.0
+
+    # A3/A4 future tactile auxiliary prediction parameters. Future tactile
+    # targets are training-only and are ignored by inference.
+    use_future_tactile_aux: bool = False
+    future_tactile_loss_weight: float = 0.5
+    future_tactile_dim: int = 128
+    future_tactile_horizon: int = 16
+
+    # A5 joint action + future tactile denoising parameters. Unlike A3/A4,
+    # future tactile latents are noised and decoded as flow-matching tokens.
+    use_joint_tactile_denoising: bool = False
+    joint_tactile_loss_weight: float = 0.5
+    joint_tactile_dim: int = 128
+    joint_tactile_horizon: int = 16
+
     # Multi-embodiment parameters
     max_num_embodiments: int = 32
 

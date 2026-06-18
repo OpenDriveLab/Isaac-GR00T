@@ -405,7 +405,7 @@ class Gr00tPolicy(BasePolicy):
 
         # Step 4: Run model inference to predict actions
         with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+            model_pred = self.model.get_action(**collated_inputs, options=options)
         normalized_action = model_pred["action_pred"].float()
 
         # Step 5: Decode actions from normalized space back to physical units
@@ -420,7 +420,21 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        info: dict[str, Any] = {}
+        if options and options.get("return_future_tactile", False):
+            tensor_info_keys = {
+                "future_tactile_pred": "future_tactile_pred_normalized",
+                "future_tactile_target": "future_tactile_target_normalized",
+                "current_tactile": "current_tactile_normalized",
+            }
+            for src_key, dst_key in tensor_info_keys.items():
+                if src_key in model_pred:
+                    info[dst_key] = model_pred[src_key].float().cpu().numpy().astype(np.float32)
+            if "future_tactile_delta_indices" in model_pred:
+                info["future_tactile_delta_indices"] = list(
+                    model_pred["future_tactile_delta_indices"]
+                )
+        return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
