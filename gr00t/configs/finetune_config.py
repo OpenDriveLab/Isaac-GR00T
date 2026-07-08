@@ -98,6 +98,9 @@ class FinetuneConfig:
     joint_tactile_horizon: int = 16
     """Number of future tactile steps jointly denoised with the action horizon."""
 
+    action_horizon: int = 16
+    """Number of action steps predicted by the policy head."""
+
     # --- Data Augmentation ---
     random_rotation_angle: int | None = None
     """Maximum rotation angle (in degrees) for random rotation augmentation of input images."""

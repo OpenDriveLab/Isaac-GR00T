@@ -91,6 +91,7 @@ if __name__ == "__main__":
     config.model.joint_tactile_loss_weight = ft_config.joint_tactile_loss_weight
     config.model.joint_tactile_dim = ft_config.joint_tactile_dim
     config.model.joint_tactile_horizon = ft_config.joint_tactile_horizon
+    config.model.action_horizon = ft_config.action_horizon
     config.model.random_rotation_angle = ft_config.random_rotation_angle
     config.model.color_jitter_params = ft_config.color_jitter_params
     if ft_config.extra_augmentation_config:
